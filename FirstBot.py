@@ -1,5 +1,5 @@
 from typing import List
-from fmclient import Agent, Order, OrderType, OrderSide, Holding, Session
+from fmclient import Agent, Order, OrderType, OrderSide, Holding, Session, Market
 from fmclient.data.orm.holding import Holding
 from fmclient.data.orm.order import Order
 from fmclient.data.orm.session import Session
@@ -10,22 +10,30 @@ import sys
 MY_ACCOUNT = "jocund-value"
 MY_EMAIL = "haohong@student.unimelb.edu.au"
 MY_PASSWORD = "1247421"
+SIMULATION_MARKET = 1308
 WIDGET_MARKET = 1304
 SINGLE_PRACTICE_MARKET = 1300
-THRESHOLD = 50  # profit margin to make a trade
+THRESHOLD = 20  # profit margin to make a trade
 CANCEL_TIME_SECOND = 5  # time to cancel order if not be traded
 
 
 class FirstBot(Agent):
+    """
+    Attributes:
+        threshold: an int used to store profit margin
+        _holdings: list used to store finished trade units and price
+
+    """
 
     def __init__(self, account: str, email: str, password: str, marketplace_id: int,
                  name: str = None, enable_ws: bool = True):
         super().__init__(account, email, password, marketplace_id, name, enable_ws)
-        self.order_sent = False
         self.public_market = None
         self.private_market = None
         self._waiting_for_server = True
         self.threshold = THRESHOLD
+        self._holdings = []
+        self.averageHoldingPrice = 0
 
     def initialised(self):
         for market_id, market in self.markets.items():
@@ -36,15 +44,16 @@ class FirstBot(Agent):
             else:
                 self.public_market = market
 
-    def accept_order(self, order: Order):
+    # function used to response to existed order
+    def respond_order(self, order: Order):
         new_order = copy.copy(order)
         new_order.order_side = -order.order_side
         super().send_order(new_order)
+        self._waiting_for_server = False
 
-    # function used to make public order with one time input
+    # function used to place order with one time input
     def place_order(self, orderSide: OrderSide, orderType: OrderType,
-                    price: int, units: int, ref: str, isPrivate: bool
-                    , owner_or_target: str):
+                    price: int, units: int, ref: str, isPrivate: bool, owner_or_target: str):
         if isPrivate:
             new_order = Order.create_new(self.private_market)
         else:
@@ -58,9 +67,9 @@ class FirstBot(Agent):
         if isPrivate:
             new_order.owner_or_target = owner_or_target
         super().send_order(new_order)
+        self._waiting_for_server = False
 
     #  function used to cancel order already exist in market
-    #  order base
     def cancel_order(self, order):
         cancel_order = copy.copy(order)
         cancel_order.order_type = OrderType.CANCEL
@@ -72,12 +81,15 @@ class FirstBot(Agent):
         for _id, asset in holdings.assets.items():
             self.inform(f"Asset {asset.market}: settled {asset.units}")
             self.inform(f"Assets {asset.market}: Available {asset.units_available}")
+            self.averageHoldingPrice += holdings.cash / asset.units
 
     def received_orders(self, orders: List[Order]):
+        # pass
         num_my_order = 0
         lowest_sell = sys.maxsize
-        highest_buy = -sys.maxsize - 1
+        highest_buy = -sys.maxsize + 1
 
+        # iterating order book
         for order_id, order in Order.current().items():
 
             # renew order book price
@@ -91,30 +103,43 @@ class FirstBot(Agent):
 
             if num_my_order == 0 and not self._waiting_for_server:
                 self._waiting_for_server = True
-                # self.place_order(OrderSide.BUY, OrderType.LIMIT,
-                #                  500, 1, "ref", False, "")
 
-            # iterating order
             # response to public/private market
             if order.market == self.public_market and self._waiting_for_server:
                 if order.order_side == OrderSide.BUY:
-                    pass
+                    # sell the stock higher than the bought price
+                    # can be improved as a function later
+                    for i in self._holdings:
+                        if order.price - self.threshold > i[1]:
+                            self.respond_order(order)
 
                 if order.order_side == OrderSide.SELL:
-                    pass
+                    if order.price + self.threshold < self.averageHoldingPrice:
+                        self.respond_order(order)
 
             if order.market == self.private_market:
                 if order.order_side == OrderSide.BUY:
-                    self.accept_order(order)
+                    self.respond_order(order)
+                    self.inform(f"Accept buy order with {order.units} units at ${order.price}")
 
                 if order.order_side == OrderSide.SELL:
-                    self.accept_order(order)
+                    self.respond_order(order)
+                    self._holdings[order_id] = order.price
+                    self.inform(f"Accept sell order with {order.units} units at ${order.price}")
+                    self._holdings.append([order.units, order.price])
 
             # cancel order if didn't be traded for a period
             if order.mine and \
                     (datetime.datetime.now().time() >
                      (order.date_created + datetime.timedelta(seconds=CANCEL_TIME_SECOND)).time()):
                 self.cancel_order(order)
+                self._waiting_for_server = True
+
+        #  calculate spread and check whether liquid the orders
+        spread = lowest_sell - highest_buy
+        if spread <= 10:
+            self.place_order(OrderSide.SELL, OrderType.LIMIT, highest_buy+5,
+                             2, "liquidity", False, "NA")
 
     def order_accepted(self, order: Order):
         self.inform(f"Order accepted: {order.ref}")
@@ -135,5 +160,5 @@ class FirstBot(Agent):
 
 
 if __name__ == "__main__":
-    bot = FirstBot(MY_ACCOUNT, MY_EMAIL, MY_PASSWORD, SINGLE_PRACTICE_MARKET)
+    bot = FirstBot(MY_ACCOUNT, MY_EMAIL, MY_PASSWORD, WIDGET_MARKET)
     bot.run()
