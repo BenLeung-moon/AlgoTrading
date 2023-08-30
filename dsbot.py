@@ -70,6 +70,13 @@ class DSBot(Agent):
 
     # read list of share from private market to decide which role to play
     def _read_past_order(self):
+
+        # check pending order
+        if len(self.mine_active_order) > 0 or len(Order.my_current()) > 0:
+            self._waiting_for_server = False
+        elif len(self.mine_active_order) == 0 or len(Order.my_current()) == 0:
+            self._waiting_for_server = True
+
         # cancel order if didn't be traded for a period
         try:
             for order in Order.my_current().values():
@@ -86,11 +93,10 @@ class DSBot(Agent):
                 if i not in Order.my_current().values():
                     self.mine_active_order.remove(i)
 
-        # check pending order
-        if len(self.mine_active_order) > 0 or len(Order.my_current()) > 0:
-            self._waiting_for_server = False
-        elif len(self.mine_active_order) == 0 or len(Order.my_current()) == 0:
-            self._waiting_for_server = True
+        if len(self.private_bought) > 0:
+            for i in self.private_bought:
+                if i.fm_id in Order.my_current().keys():
+                    self.private_bought.remove(i)
 
         # setting BotType
         if len(self.private_bought) > 0:
@@ -98,6 +104,8 @@ class DSBot(Agent):
             # setting role
             if self.private_bought[0].order_side == OrderSide.SELL:
                 self._role = Role.SELLER
+            elif self.holdings.assets[self._public_market].units_available <= 0:
+                self._role = Role.BUYER
             else:
                 self._role = Role.BUYER
         else:
@@ -147,25 +155,25 @@ class DSBot(Agent):
     #  calculate current profit
     def _get_profit(self):
         return self.holdings.cash - self.holdings.cash_initial \
-               + self._public_market.max_price * (self.holdings.assets[self._private_market].units
-                                                  + self.holdings.assets[self._public_market].units
-                                                  - self.holdings.assets[self._private_market].units_initial -
-                                                  self.holdings.assets[self._public_market].units_initial)
+            + self._public_market.max_price * (self.holdings.assets[self._private_market].units
+                                               + self.holdings.assets[self._public_market].units
+                                               - self.holdings.assets[self._private_market].units_initial -
+                                               self.holdings.assets[self._public_market].units_initial)
 
     # calculate profit after trade
     def _after_profit(self, order: Order):
         if order.order_side == OrderSide.BUY:
             return self.holdings.cash + (order.units * order.price) - self.holdings.cash_initial \
-                   + self._public_market.max_price * (self.holdings.assets[self._private_market].units - order.units
-                                                      + self.holdings.assets[self._public_market].units
-                                                      - self.holdings.assets[self._private_market].units_initial -
-                                                      self.holdings.assets[self._public_market].units_initial)
+                + self._public_market.max_price * (self.holdings.assets[self._private_market].units - order.units
+                                                   + self.holdings.assets[self._public_market].units
+                                                   - self.holdings.assets[self._private_market].units_initial -
+                                                   self.holdings.assets[self._public_market].units_initial)
         else:
             return self.holdings.cash - (order.units * order.price) - self.holdings.cash_initial \
-                   + self._public_market.max_price * (self.holdings.assets[self._private_market].units + order.units
-                                                      + self.holdings.assets[self._public_market].units
-                                                      - self.holdings.assets[self._private_market].units_initial -
-                                                      self.holdings.assets[self._public_market].units_initial)
+                + self._public_market.max_price * (self.holdings.assets[self._private_market].units + order.units
+                                                   + self.holdings.assets[self._public_market].units
+                                                   - self.holdings.assets[self._private_market].units_initial -
+                                                   self.holdings.assets[self._public_market].units_initial)
 
     # Calculate if a order profitable
     def _order_profitable(self, order: Order):
@@ -183,7 +191,7 @@ class DSBot(Agent):
     def order_rejected(self, info, order: Order):
         self.warning(f"Order rejected {info}")
 
-    # to check if have enough available money or asset to respond
+    # to check if you have enough available money or asset to respond
     def _available_trade(self, order: Order):
         if order.market == self._public_market:
             if (self._order_profitable(order) and self._check_bot_type() == BotType.PROACTIVE) \
@@ -207,9 +215,9 @@ class DSBot(Agent):
             elif order.order_side == OrderSide.SELL and \
                     self.holdings.cash_available >= order.price * order.units:
                 return True
+            self._print_trade_opportunity(order, False)
             return False
         else:
-            self._print_trade_opportunity(order, False)
             return False
 
     def received_orders(self, orders: List[Order]):
@@ -220,9 +228,11 @@ class DSBot(Agent):
         for order_id, order in Order.current().items():
 
             # renew order book price
-            if order.order_side == OrderSide.BUY and order.price > highest_buy.price:
+            if order.order_side == OrderSide.BUY and order.price > highest_buy.price\
+                    and order.market == self._public_market:
                 highest_buy = order
-            elif order.order_side == OrderSide.SELL and order.price < lowest_sell.price:
+            elif order.order_side == OrderSide.SELL and order.price < lowest_sell.price\
+                    and order.market == self._public_market:
                 lowest_sell = order
 
             # receiving private order
@@ -230,8 +240,9 @@ class DSBot(Agent):
                 self._read_past_order()
                 if order.market == self._private_market and self._available_trade(order) \
                         and self._is_waiting_for_server() and not order.mine \
-                        and order not in self.private_bought\
-                        and order_id in Order.current().keys():
+                        and order not in self.private_bought \
+                        and order_id in Order.current().keys()\
+                        and len(Order.my_current()) == 0:
                     if order.order_side == OrderSide.BUY:
                         self._respond_order(order)
                         self.private_bought.insert(0, order)
@@ -251,7 +262,8 @@ class DSBot(Agent):
         try:
             self._read_past_order()
             if self._is_waiting_for_server() and self._check_bot_type() == BotType.PROACTIVE \
-                    and len(self.mine_active_order) == 0:
+                    and len(self.mine_active_order) == 0 \
+                    and len(Order.my_current()) == 0:
                 if self.last_public_order.fm_id != Order(None).fm_id:
                     if self.role() == Role.BUYER and self._available_trade(self.last_public_order) \
                             and self._order_profitable(lowest_sell):
@@ -279,7 +291,8 @@ class DSBot(Agent):
         try:
             self._read_past_order()
             if self._check_bot_type() == BotType.REACTIVE and self._is_waiting_for_server() \
-                    and len(self.mine_active_order) == 0:
+                    and len(self.mine_active_order) == 0 \
+                    and len(Order.my_current()) == 0:
                 if self.role() == Role.SELLER \
                         and highest_buy.price > self.private_bought[0].price + PROFIT_MARGIN \
                         and self._available_trade(highest_buy):
@@ -289,7 +302,7 @@ class DSBot(Agent):
                                           MAX_ORDER_UNITS, self._order_ref_num())
                     else:
                         self._place_order(OrderSide.SELL, OrderType.LIMIT,
-                                          self.private_bought[0].price - PROFIT_MARGIN,
+                                          self.private_bought[0].price + PROFIT_MARGIN,
                                           MAX_ORDER_UNITS, self._order_ref_num())
                     self.private_bought.pop(0)
 
@@ -302,7 +315,7 @@ class DSBot(Agent):
                                           MAX_ORDER_UNITS, self._order_ref_num())
                     else:
                         self._place_order(OrderSide.BUY, OrderType.LIMIT,
-                                          self.private_bought[0].price + PROFIT_MARGIN,
+                                          self.private_bought[0].price - PROFIT_MARGIN,
                                           MAX_ORDER_UNITS, self._order_ref_num())
                     self.private_bought.pop(0)
         except RuntimeError:
