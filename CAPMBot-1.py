@@ -16,7 +16,8 @@ FM_PASSWORD = "1247421"
 MARKETPLACE_ID = 1316  # replace this with the marketplace id
 SIMULATION_MARKET = 1323
 MAX_ORDER_UNITS = 1  # max units can send in one order
-ORDER_OVERDUE_SECOND = 8
+ORDER_OVERDUE_SECOND = 12
+PERFORMANCE_LOSS_FLOOR = -500
 LOW_CASH_THRESHOLD = 1500  # threshold to sell note
 
 
@@ -63,6 +64,9 @@ class Stock(Enum):
     C = 2
     NOTE = 3
 
+class BotType(Enum):
+    Reactive = 0
+    Proactive = 1
 
 class CAPMBot(Agent):
 
@@ -98,6 +102,7 @@ class CAPMBot(Agent):
         self._cash_available = 0
         self._best_price = {}
         self._sent_order = {}
+        self._BotType = BotType.Reactive
         self._waiting_for_order = True
         self._waiting_for_latest_holding = True
         self._market_open = False
@@ -143,6 +148,9 @@ class CAPMBot(Agent):
         :return: list of _stock_holding
         """
         return self._stock_holding
+
+    def _get_bot_type(self):
+        return self._BotType
 
     def _order_ref_num(self):
         self.order_ref += 1
@@ -302,7 +310,7 @@ class CAPMBot(Agent):
         """
         find the least loss order to realise cash
         """
-        delta_performance = -1000
+        delta_performance = PERFORMANCE_LOSS_FLOOR
         realise_order = []
 
         for stock_id, best_price in self._best_price.items():
@@ -377,6 +385,12 @@ class CAPMBot(Agent):
         self.inform(f"order ref {order.ref} accept by server：{order}")
         if order.order_type == OrderType.LIMIT:
             self._sent_order[order.ref] = order
+
+        try:
+            self._cancel_pending_order()
+        except BaseException:
+            self.inform("_cancel_pending_order error")
+
         self._check_pending_order()
 
     def order_rejected(self, info, order):
@@ -385,15 +399,11 @@ class CAPMBot(Agent):
         self.inform(f"reject raise")
 
     def received_orders(self, orders: List[Order]):
+
         try:
             self._match_order_ref()
         except Exception:
             self.inform("match order error")
-
-        try:
-            self._cancel_pending_order()
-        except BaseException:
-            self.inform("_cancel_pending_order error")
 
         try:
             self._reset_best_price()
@@ -406,7 +416,8 @@ class CAPMBot(Agent):
         except Exception:
             self.inform("renew price error")
 
-        if not self.is_portfolio_optimal() and self._states_sync():
+        if not self.is_portfolio_optimal() and self._states_sync()\
+                and self._get_bot_type() == BotType.Reactive:
             # optimise portfolio, reactive
             try:
                 order_to_respond = self._find_optimal_portfolio()
@@ -415,23 +426,30 @@ class CAPMBot(Agent):
                 if len(order_to_respond) != 0:
                     for i in order_to_respond:
                         self._respond_order(i)
-
+                else:
+                    self._BotType = BotType.Proactive
             except IndexError:
                 self.inform(f"reactive trade error")
 
-        elif self._states_sync:
+        elif self._states_sync and self._BotType == BotType.Proactive:
             # portfolio already optimal, proactive
             try:
-                # if self._get_cash() <= LOW_CASH_THRESHOLD:
-                #     realise_order = self._find_best_realise_order()
-                #     if type(realise_order) == Order:
-                #         self._place_order(market=realise_order.market, orderSide=OrderSide.SELL,
-                #                           orderType=OrderType.LIMIT, price=realise_order.price,
-                #                           units=MAX_ORDER_UNITS, ref=self._order_ref_num())
-                #         self.inform("from proactive")
                 self._realise_note()
+                self._BotType = BotType.Reactive
             except BaseException:
                 self.inform(f"proactive trade error")
+
+    def _realise_stock(self):
+        """
+        Sell stocks to realise cash when bot have low cash
+        """
+        if self._get_cash() <= LOW_CASH_THRESHOLD:
+            realise_order = self._find_best_realise_order()
+            if type(realise_order) == Order:
+                self._place_order(market=realise_order.market, orderSide=OrderSide.SELL,
+                                  orderType=OrderType.LIMIT, price=realise_order.price,
+                                  units=MAX_ORDER_UNITS, ref=self._order_ref_num())
+                self._waiting_for_order = False
 
     def _realise_note(self):
         """
@@ -442,7 +460,6 @@ class CAPMBot(Agent):
                 and 'BUY' in self._best_price['Note'].keys():
             self._place_order(self.markets[self._market_ids['Note']], OrderSide.SELL, OrderType.LIMIT,
                               self._best_price['Note']['BUY'].price - 1, MAX_ORDER_UNITS, self._order_ref_num())
-            self.inform("from proactive")
             self._waiting_for_order = False
 
     def _renew_best_price(self, order: Order):
@@ -501,7 +518,7 @@ class CAPMBot(Agent):
         """
         set the bot stay in not waiting order states if still pending orders
         """
-        if len(self._sent_order) > 0:
+        if len(self._sent_order) > 1:
             self._waiting_for_order = False
         else:
             self._waiting_for_order = True
@@ -510,7 +527,7 @@ class CAPMBot(Agent):
         """
         match local dict of ref number and server my order to renew pending order
         """
-        if len(self._sent_order) != 0 and len(Order.my_current()) > 0:
+        if len(self._sent_order) != 0 or len(Order.my_current()) > 0:
             try:
                 exist_order = []
                 inactive_order = []
