@@ -3,7 +3,7 @@ This is a template bot for  the CAPM Task.
 """
 from enum import Enum
 from typing import List
-from fmclient import Agent, Order, OrderType, OrderSide, Holding, Session, Market
+from fmclient import Agent, Order, OrderType, OrderSide, Session
 import datetime
 import copy
 
@@ -114,7 +114,7 @@ class CAPMBot(Agent):
         self.inform("Bot initialised, I have the payoffs for the states.")
 
     def _get_cash_available(self):
-        return self.holdings.cash_available
+        return self._cash_available
 
     def _get_cash(self):
         """
@@ -298,6 +298,25 @@ class CAPMBot(Agent):
         except IndexError:
             self.inform("method _find_optimal_portfolio raise error")
 
+    def _find_best_realise_order(self):
+        """
+        find the least loss order to realise cash
+        """
+        delta_performance = -1000
+        realise_order = []
+
+        for stock_id, best_price in self._best_price.items():
+            for order in best_price.values():
+                if order.order_side == OrderSide.BUY:
+                    if self.get_potential_performance([order]) \
+                            - self._compute_performance(self._get_stock_holding(), self._get_cash()) \
+                            > delta_performance and self._is_valid_order([order]):
+                        delta_performance = self.get_potential_performance([order]) \
+                                            - self._compute_performance(self._get_stock_holding(), self._get_cash())
+                        realise_order = order
+
+        return realise_order
+
     def _place_order(self, market, orderSide: OrderSide, orderType: OrderType,
                      price: int, units: int, ref: str):
         """
@@ -319,6 +338,7 @@ class CAPMBot(Agent):
 
         if self._is_valid_order([new_order]):
             super().send_order(new_order)
+            self._update_holdings(new_order)
             self._waiting_for_order = False
             self._waiting_for_latest_holding = True
 
@@ -338,6 +358,7 @@ class CAPMBot(Agent):
 
         if self._is_valid_order([new_order]):
             super().send_order(new_order)
+            self._update_holdings(new_order)
             self._waiting_for_order = False
             self._waiting_for_latest_holding = True
 
@@ -349,6 +370,7 @@ class CAPMBot(Agent):
         cancel_order = copy.copy(order)
         cancel_order.order_type = OrderType.CANCEL
         super().send_order(cancel_order)
+        self._update_holdings(cancel_order)
         self._waiting_for_latest_holding = True
 
     def order_accepted(self, order):
@@ -359,6 +381,8 @@ class CAPMBot(Agent):
 
     def order_rejected(self, info, order):
         self.warning(f"Order rejected {info}")
+        self.inform(f"order is:{order}, assets condition: {self._stock_available}, {self._cash_available}")
+        self.inform(f"reject raise")
 
     def received_orders(self, orders: List[Order]):
         try:
@@ -379,7 +403,7 @@ class CAPMBot(Agent):
         try:
             for order_id, order in Order.current().items():
                 self._renew_best_price(order)
-        except:
+        except Exception:
             self.inform("renew price error")
 
         if not self.is_portfolio_optimal() and self._states_sync():
@@ -398,6 +422,13 @@ class CAPMBot(Agent):
         elif self._states_sync:
             # portfolio already optimal, proactive
             try:
+                # if self._get_cash() <= LOW_CASH_THRESHOLD:
+                #     realise_order = self._find_best_realise_order()
+                #     if type(realise_order) == Order:
+                #         self._place_order(market=realise_order.market, orderSide=OrderSide.SELL,
+                #                           orderType=OrderType.LIMIT, price=realise_order.price,
+                #                           units=MAX_ORDER_UNITS, ref=self._order_ref_num())
+                #         self.inform("from proactive")
                 self._realise_note()
             except BaseException:
                 self.inform(f"proactive trade error")
@@ -410,8 +441,8 @@ class CAPMBot(Agent):
                 and self._get_stock_available()[Stock.NOTE.value] > 0 \
                 and 'BUY' in self._best_price['Note'].keys():
             self._place_order(self.markets[self._market_ids['Note']], OrderSide.SELL, OrderType.LIMIT,
-                              self._best_price['Note']['BUY'].price, MAX_ORDER_UNITS, self._order_ref_num())
-            # self._respond_order(self._best_price['Note']['BUY'])
+                              self._best_price['Note']['BUY'].price - 1, MAX_ORDER_UNITS, self._order_ref_num())
+            self.inform("from proactive")
             self._waiting_for_order = False
 
     def _renew_best_price(self, order: Order):
@@ -453,16 +484,16 @@ class CAPMBot(Agent):
         """
         if len(self._sent_order) > 0:
             try:
+                sent_cancel = []
+
                 for ref, order in self._sent_order.items():
                     if (datetime.datetime.now().time() >
                             (order.date_created + datetime.timedelta(seconds=ORDER_OVERDUE_SECOND)).time()):
                         self._cancel_order(order)
-                        self._sent_order.pop(ref, f'order {ref} Already Cancel')
+                        sent_cancel.append(ref)
 
-                    if len(self._sent_order) == 0:
-                        break
-                    else:
-                        continue
+                for i in sent_cancel:
+                    self._sent_order.pop(i, 'order Already Cancel')
             except IndexError:
                 self.inform("Error in Cancel Order")
 
@@ -482,13 +513,23 @@ class CAPMBot(Agent):
         if len(self._sent_order) != 0 and len(Order.my_current()) > 0:
             try:
                 exist_order = []
+                inactive_order = []
+                # check order is active
                 for i in Order.my_current().values():
                     exist_order.append(i.ref)
+
+                # remove order not in sent_order
                 for i in self._sent_order.keys():
                     if i not in exist_order:
-                        self._sent_order.pop(i, f'order {i} Already Cancel')
-                    if len(self._sent_order) == 0:
-                        break
+                        inactive_order.append(i)
+                for i in inactive_order:
+                    self._sent_order.pop(i, 'order Already Cancel')
+
+                # add active order but not in sent_order
+                for i in Order.my_current().values():
+                    if i.ref not in self._sent_order.keys():
+                        self._sent_order[i.ref] = i
+
             except BaseException:
                 self.inform("_match_order_ref raise error")
 
@@ -500,7 +541,26 @@ class CAPMBot(Agent):
         except (IndexError, TypeError):
             self.inform("method _reset_best_price raise error")
 
+    def _update_holdings(self, order):
+        """
+        Update local holdings data when order is placed
+        """
+        if order.order_type == OrderType.LIMIT:
+            if order.order_side == OrderSide.BUY:
+                self._cash_available -= order.units * order.price
+            else:
+                self._stock_available[_get_stock_code(order.market.item)] -= order.units
+                self._stock_holding[_get_stock_code(order.market.item)] -= order.units
+
+        elif order.order_type == OrderType.CANCEL:
+            if order.order_side == OrderSide.BUY:
+                self._cash_available += order.units * order.price
+            else:
+                self._stock_available[_get_stock_code(order.market.item)] += order.units
+                self._stock_holding[_get_stock_code(order.market.item)] += order.units
+
     def _sync_assets_holdings(self):
+        self._cash_available = self.holdings.cash_available
         for _id, asset in self.holdings.assets.items():
             self._stock_holding[_get_stock_code(_id.item)] = asset.units
             self._stock_available[_get_stock_code(_id.item)] = asset.units_available
@@ -517,5 +577,5 @@ class CAPMBot(Agent):
 
 
 if __name__ == "__main__":
-    bot = CAPMBot(FM_ACCOUNT, FM_EMAIL, FM_PASSWORD, MARKETPLACE_ID)
+    bot = CAPMBot(FM_ACCOUNT, FM_EMAIL, FM_PASSWORD, SIMULATION_MARKET)
     bot.run()
